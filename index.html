@@ -73,267 +73,171 @@
 </div>
 
 <script>
-(() => {
-  // ====== 状態 ======
-  let watchId=null, accM=null, spd=0, courseDeg=null;
-  let ref=null;               // ENU原点（A設定時にAへ）
-  let A=null, A_ll=null;      // A（ENU座標）, Aの緯度経度
-  let B_ll=null;              // Bの緯度経度（参考表示）
-  let line=null;              // {p0:[e,n], dir:[x,y], nHat:[x,y], theta}
-  let settingA=false, settingB=false;
-  let crossTrack=0, alongTrack=0, distFromA=0;
-  let wakeLock=null, gain=2.0;
+// ========== ユーティリティ ==========
+function ll2enu(lat, lon, lat0, lon0){
+  const R = 6378137;
+  const dLat = (lat-lat0)*Math.PI/180;
+  const dLon = (lon-lon0)*Math.PI/180;
+  const x = dLon*Math.cos((lat+lat0)/2*Math.PI/180)*R;
+  const y = dLat*R;
+  return [x,y];
+}
+function norm(v){ return Math.sqrt(v[0]*v[0]+v[1]*v[1]); }
+function normalize(v){ const n=norm(v); return [v[0]/n,v[1]/n]; }
 
-  // ログ
-  let logging=false;
-  let log=[];
+// ========== 状態 ==========
+let watchId=null, ref=null, A_ll=null, B_ll=null, line=null;
+let crossTrack=0, alongTrack=0, settingA=false, settingB=false;
+let gain=10; // 線の動きの倍率（あとで調整可）
 
-  // ====== UI ======
-  const statGps=document.getElementById('statGps');
-  const statAcc=document.getElementById('statAcc');
-  const statSpd=document.getElementById('statSpd');
-  const statHead=document.getElementById('statHead');
-  const statAB=document.getElementById('statAB');
-  const statABlen=document.getElementById('statABlen');
-  const statLog=document.getElementById('statLog');
+// ログ
+let logging=false, log=[];
 
-  const stateBadge=document.getElementById('stateBadge');
-  const dirEl=document.getElementById('dir');
-  const subEl=document.getElementById('sub');
-
-  const canvas=document.getElementById('vis');
-  const ctx=canvas.getContext('2d');
-
-  const btnStart=document.getElementById('btnStart');
-  const btnStop=document.getElementById('btnStop');
-  const btnWake=document.getElementById('btnWake');
-  const btnA=document.getElementById('btnA');
-  const btnB=document.getElementById('btnB');
-  const btnClear=document.getElementById('btnClear');
-  const gainInp=document.getElementById('gain');
-
-  const btnLogToggle=document.getElementById('logToggle');
-  const btnLogDownload=document.getElementById('logDownload');
-
-  // ====== 数学 util ======
-  const R=6378137.0;
-  const toRad = d => d*Math.PI/180;
-  function ll2enu(lat,lon,refLat,refLon){
-    const dLat=(lat-refLat)*Math.PI/180, dLon=(lon-refLon)*Math.PI/180;
-    const mPerDegLat=Math.PI*R/180, mPerDegLon=mPerDegLat*Math.cos(refLat*Math.PI/180);
-    return [dLon*mPerDegLon, dLat*mPerDegLat]; // [e, n]
+// ========== ログ記録 ==========
+function addLog(c,spd,courseDeg,distFromA){
+  if(logging){
+    log.push({
+      t:new Date().toISOString(),
+      lat:c.latitude, lon:c.longitude, acc:c.accuracy,
+      speed:spd, heading:courseDeg,
+      cross:crossTrack, along:alongTrack, distA:distFromA,
+      abSet:!!line, gain:gain
+    });
   }
-  // ハバースイン：Aからの地表直線距離[m]
-  function haversine(lat1,lon1,lat2,lon2){
-    const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
-    const s1=Math.sin(dLat/2), s2=Math.sin(dLon/2);
-    const a=s1*s1 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*s2*s2;
-    return 2*6371000*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+function downloadLog(){
+  const header='t,lat,lon,acc_m,speed_mps,heading_deg,cross_m,along_m,distA_m,AB_set,gain\n';
+  const rows=log.map(r =>
+    `${r.t},${r.lat},${r.lon},${r.acc ?? ''},${r.speed ?? ''},${r.heading ?? ''},${r.cross.toFixed(3)},${r.along.toFixed(3)},${r.distA.toFixed(3)},${r.abSet},${r.gain}`
+  ).join('\n');
+  const blob=new Blob([header+rows],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`straightbar_${new Date().toISOString().replace(/[:.]/g,'-')}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ========== UI 更新 ==========
+function updatePanels(){
+  const st=document.getElementById('status');
+  let msg='';
+  if(settingA) msg='A点設定中...';
+  else if(settingB) msg='B点設定中...';
+  else if(line) msg=`AB設定済: 横ズレ=${crossTrack.toFixed(2)} m, Aから=${alongTrack.toFixed(1)} m`;
+  else msg='待機中';
+  st.textContent=msg;
+
+  // 線の描画
+  const cvs=document.getElementById('cv');
+  const ctx=cvs.getContext('2d');
+  ctx.clearRect(0,0,cvs.width,cvs.height);
+
+  // 真ん中の基準線
+  ctx.beginPath();
+  ctx.moveTo(cvs.width/2,0);
+  ctx.lineTo(cvs.width/2,cvs.height);
+  ctx.lineWidth=4;
+  ctx.strokeStyle='gray';
+  ctx.stroke();
+
+  // 動く線（横ズレに比例）
+  if(line){
+    const dx=crossTrack*gain; // 横ズレを拡大
+    ctx.beginPath();
+    ctx.moveTo(cvs.width/2+dx,0);
+    ctx.lineTo(cvs.width/2+dx,cvs.height);
+    ctx.lineWidth=6;
+    ctx.strokeStyle=(Math.abs(crossTrack)<1.0)?'lime':'red';
+    ctx.stroke();
   }
-  const dot=(a,b)=>a[0]*b[0]+a[1]*b[1];
-  const sub=(a,b)=>[a[0]-b[0],a[1]-b[1]];
-  const norm=a=>Math.hypot(a[0],a[1]);
-  const normalize=v=>{const L=norm(v)||1; return [v[0]/L,v[1]/L];}
-  const angleWrap=x=>{while(x>Math.PI)x-=2*Math.PI;while(x<-Math.PI)x+=2*Math.PI;return x;}
+}
 
-  // ====== Canvas ======
-  function resize(){ canvas.width=canvas.clientWidth; canvas.height=canvas.clientHeight; draw(); }
-  window.addEventListener('resize', resize); resize();
+// ========== Aボタン ==========
+btnA.addEventListener('click', ()=>{
+  settingA=true; updatePanels();
+  navigator.geolocation.getCurrentPosition(c=>{
+    A_ll={lat:c.coords.latitude,lon:c.coords.longitude};
+    ref={lat:A_ll.lat,lon:A_ll.lon};
+    settingA=false; updatePanels();
+  },err=>{ alert('A失敗:'+err.message); settingA=false; updatePanels(); },
+  {enableHighAccuracy:true});
+});
 
-  function draw(){
-    const w=canvas.width,h=canvas.height;
-    ctx.clearRect(0,0,w,h);
-    ctx.fillStyle='#0f0f14'; ctx.fillRect(0,0,w,h);
+// ========== Bボタン（改良版） ==========
+// 新しいB点測位関数
+async function getFreshPositionForB({durationMs=2000, accLimit=12} = {}){
+  return new Promise((resolve,reject)=>{
+    const samples=[]; const start=Date.now(); let done=false;
+    const wid=navigator.geolocation.watchPosition(
+      p=>{
+        const c=p.coords; samples.push(c);
+        if(c.accuracy && c.accuracy<=accLimit && !done){
+          done=true; navigator.geolocation.clearWatch(wid); resolve(c);
+        }else if(Date.now()-start>=durationMs && !done){
+          done=true; navigator.geolocation.clearWatch(wid);
+          let best=samples[0];
+          for(const s of samples){ if(s.accuracy<best.accuracy) best=s; }
+          resolve(best);
+        }
+      },
+      err=>{ if(!done){done=true; reject(err);} },
+      {enableHighAccuracy:true,maximumAge:0,timeout:5000}
+    );
+  });
+}
 
-    // 背景の薄い縦ガイド
-    ctx.strokeStyle='#202028'; ctx.lineWidth=1;
-    for(let i=0;i<6;i++){ const x=i*w/6; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+btnB.addEventListener('click', async ()=>{
+  if(!A_ll){ alert('先にA点を設定してください'); return; }
+  settingB=true; updatePanels();
+  try{
+    const c=await getFreshPositionForB({durationMs:2500, accLimit:12});
+    B_ll={lat:c.latitude,lon:c.longitude};
+    const B=ll2enu(B_ll.lat,B_ll.lon,ref.lat,ref.lon);
+    const v=[B[0],B[1]]; const L=norm(v);
+    const required=Math.max(5,(c.accuracy??6)+5);
+    if(L<required){ settingB=false; updatePanels();
+      alert(`Aからの距離が不足:${L.toFixed(1)}m (必要${required.toFixed(1)}m)`); return; }
+    const dir=normalize(v); const nHat=[-dir[1],dir[0]];
+    line={p0:[0,0],dir,nHat,theta:Math.atan2(dir[1],dir[0])};
+    settingB=false; updatePanels();
+  }catch(e){ settingB=false; updatePanels(); alert('B失敗:'+e.message); }
+});
 
-    // 表示レンジ（px/ｍ）
-    const rangeM=6; // 片側6mまでを基準（感度で見え方調整）
-    const pxPerM=w/(rangeM*2);
+// ========== クリア ==========
+btnClear.addEventListener('click', ()=>{ A_ll=null; B_ll=null; line=null; updatePanels(); });
 
-    // 中央の固定ライン（水色・太め）
-    const centerX=w/2;
-    ctx.strokeStyle='#38bdf8'; ctx.lineWidth=6;
-    ctx.beginPath(); ctx.moveTo(centerX,0); ctx.lineTo(centerX,h); ctx.stroke();
-
-    // 可動ライン（横ズレ×感度で移動、色は誤差に応じて）
-    let moveX=centerX + (crossTrack*gain)*pxPerM;
-    moveX=Math.max(0, Math.min(w, moveX)); // 可視範囲にクランプ
-    const absE=Math.abs(crossTrack);
-    const color = absE<=0.10 ? '#19c37d' : (absE<=0.30 ? '#f5a524' : '#ef4444'); // 10cm/30cm
-    ctx.strokeStyle=color; ctx.lineWidth=10;
-    ctx.beginPath(); ctx.moveTo(moveX,0); ctx.lineTo(moveX,h); ctx.stroke();
-  }
-
-  // ====== UI更新 ======
-  function updatePanels(){
-    statGps.textContent = watchId?'GPS: 取得中':'GPS: -';
-    statAcc.textContent = '精度: '+(accM==null?'-':`${accM.toFixed(0)}m`);
-    statSpd.textContent = '速度: '+(spd?(spd*3.6).toFixed(1)+'km/h':'-');
-    statHead.textContent= '針路: '+(courseDeg==null?'-':`${courseDeg.toFixed(0)}°`);
-
-    if(settingA){ statAB.textContent='A/B: A点設定中'; statAB.className='badge warn'; }
-    else if(settingB){ statAB.textContent='A/B: B点設定中'; statAB.className='badge warn'; }
-    else if(line){ statAB.textContent='A/B: 設定済'; statAB.className='badge ok'; }
-    else if(A_ll){ statAB.textContent='A/B: Aのみ設定'; statAB.className='badge'; }
-    else { statAB.textContent='A/B: 未設定'; statAB.className='badge muted'; }
-
-    const showABLen = (A_ll && B_ll) ? `${(haversine(A_ll.lat,A_ll.lon,B_ll.lat,B_ll.lon)).toFixed(1)} m` : '-';
-    statABlen.textContent = 'AB距離: ' + showABLen;
-
-    statLog.textContent = `LOG: ${log.length}点`;
-    statLog.className = 'badge ' + (logging ? 'ok' : 'muted');
-
-    // 大表示（横ズレ）
-    const sign = crossTrack>0?'左へ':(crossTrack<0?'右へ':'そのまま');
-    dirEl.textContent = line ? ((Math.abs(crossTrack)<0.005)? '0.00' : `${sign} ${Math.abs(crossTrack).toFixed(2)}`) : '--';
-
-    // 補足
-    subEl.textContent = `横ズレ: ${Math.abs(crossTrack).toFixed(2)} m / Aから: ${distFromA.toFixed(1)} m / 沿線距離: ${alongTrack.toFixed(1)} m`;
-
-    draw();
-  }
-
-  // ====== 計測開始/停止 ======
-  btnStart.addEventListener('click', ()=>{
-    if(watchId!=null) return;
-    if(!navigator.geolocation){ alert('Geolocation未対応'); return; }
-    watchId = navigator.geolocation.watchPosition(p=>{
-      const c=p.coords;
-      accM=c.accuracy??null;
-      spd=(c.speed!=null&&c.speed>0)?c.speed:0;
-      courseDeg=(c.heading!=null&&c.heading>=0)?c.heading:null;
-
-      // 参照（ENU原点）が未設定なら現在地で仮セット（A設定で上書き）
-      if(!ref) ref={lat:c.latitude, lon:c.longitude};
-
-      // ENU座標
-      const pt=ll2enu(c.latitude,c.longitude,ref.lat,ref.lon);
-
-      // Aからの地表直線距離
-      if(A_ll){ distFromA = haversine(A_ll.lat, A_ll.lon, c.latitude, c.longitude); }
-      else { distFromA = 0; }
-
-      if(line){
-        crossTrack = dot( sub(pt,line.p0), line.nHat ); // 法線方向のズレ
-        alongTrack = dot( sub(pt,line.p0), line.dir );  // 直線方向の進み
-      } else {
-        crossTrack = 0; alongTrack = 0;
-      }
-
-      // ログ記録
-      if (logging) {
-        log.push({
-          t: new Date().toISOString(),
-          lat: c.latitude,
-          lon: c.longitude,
-          acc: c.accuracy,
-          speed: spd,
-          heading: courseDeg,
-          cross: crossTrack,
-          along: alongTrack,
-          distA: distFromA,
-          abSet: !!line,
-          gain: gain
-        });
-      }
-
-      updatePanels();
-    }, e=>alert('位置失敗: '+e.message),
-       {enableHighAccuracy:true, maximumAge:0, timeout:7000});
-    stateBadge.textContent='計測中'; stateBadge.className='badge';
+// ========== 計測開始/停止 ==========
+btnStart.addEventListener('click', ()=>{
+  if(watchId) return;
+  watchId=navigator.geolocation.watchPosition(p=>{
+    const c=p.coords;
+    let e=[0,0]; let distFromA=0;
+    if(ref){ e=ll2enu(c.latitude,c.longitude,ref.lat,ref.lon); }
+    if(line){
+      const v=[e[0]-line.p0[0],e[1]-line.p0[1]];
+      crossTrack=v[0]*line.nHat[0]+v[1]*line.nHat[1];
+      alongTrack=v[0]*line.dir[0]+v[1]*line.dir[1];
+      distFromA=norm(v);
+    }
     updatePanels();
-  });
+    addLog(c,c.speed,(c.heading??0),distFromA);
+  },err=>alert(err.message),{enableHighAccuracy:true});
+});
 
-  btnStop.addEventListener('click', ()=>{
-    if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
-    stateBadge.textContent='停止中'; stateBadge.className='badge muted';
-    updatePanels();
-  });
+btnStop.addEventListener('click', ()=>{
+  if(watchId){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+});
 
-  // ====== A/B設定 ======
-  btnA.addEventListener('click', ()=>{
-    if(!watchId){ alert('先に「計測開始」を押してください'); return; }
-    settingA=true; settingB=false; updatePanels();
-    navigator.geolocation.getCurrentPosition(p=>{
-      A_ll = {lat:p.coords.latitude, lon:p.coords.longitude}; // Aの緯度経度
-      ref = {lat:A_ll.lat, lon:A_ll.lon}; // ENU原点をAへ
-      A = [0,0];
-      line=null; crossTrack=0; alongTrack=0; distFromA=0;
-      settingA=false; updatePanels();
-    }, e=>{ settingA=false; updatePanels(); alert('A取得失敗: '+e.message); },
-       {enableHighAccuracy:true, maximumAge:0, timeout:7000});
-  });
+// ========== ログボタン ==========
+document.getElementById('logToggle').addEventListener('click',()=>{
+  logging=!logging; if(logging){ log=[]; }
+  document.getElementById('logToggle').textContent=logging?'ログ記録:ON':'ログ記録:OFF';
+});
+document.getElementById('logDownload').addEventListener('click',downloadLog);
 
-  btnB.addEventListener('click', ()=>{
-    if(!A_ll){ alert('先にA点を設定してください'); return; }
-    settingB=true; updatePanels();
-    navigator.geolocation.getCurrentPosition(p=>{
-      B_ll = {lat:p.coords.latitude, lon:p.coords.longitude};
-      const B = ll2enu(B_ll.lat, B_ll.lon, ref.lat, ref.lon); // refはA
-      const v=[B[0]-A[0], B[1]-A[1]];
-      const L=norm(v);
-      if(L<3){ settingB=false; updatePanels(); alert('AとBが近すぎ（3m以上推奨）'); return; }
-      const dir=normalize(v); const nHat=[-dir[1], dir[0]];
-      const theta=Math.atan2(dir[1], dir[0]);
-      line={p0:[A[0],A[1]], dir, nHat, theta};
-      crossTrack=0; alongTrack=0;
-      settingB=false; updatePanels();
-    }, e=>{ settingB=false; updatePanels(); alert('B取得失敗: '+e.message); },
-       {enableHighAccuracy:true, maximumAge:0, timeout:7000});
-  });
-
-  btnClear.addEventListener('click', ()=>{
-    line=null; A=null; A_ll=null; B_ll=null; crossTrack=0; alongTrack=0; distFromA=0;
-    stateBadge.textContent='待機中'; stateBadge.className='badge muted';
-    updatePanels();
-  });
-
-  // 感度
-  gainInp.addEventListener('change', ()=>{
-    const g=parseFloat(gainInp.value||'2');
-    gain = isFinite(g) ? Math.max(0.5, Math.min(4.0, g)) : 2.0;
-    gainInp.value = gain.toFixed(1);
-    draw();
-  });
-
-  // 画面常時ON
-  btnWake.addEventListener('click', async ()=>{
-    try{
-      if(!('wakeLock' in navigator)){ alert('Wake Lock未対応端末。iPhoneは省電力設定に注意'); return; }
-      if(!wakeLock){ wakeLock=await navigator.wakeLock.request('screen'); btnWake.textContent='常時ON: 有効'; }
-      else { await wakeLock.release(); wakeLock=null; btnWake.textContent='画面常時ON'; }
-    }catch(e){ alert('Wake Lock失敗: '+e.message); }
-  });
-
-  // ログ操作
-  btnLogToggle.addEventListener('click', ()=>{
-    logging = !logging;
-    if (logging) { log = []; btnLogToggle.classList.add('on'); }
-    else { btnLogToggle.classList.remove('on'); }
-    btnLogToggle.textContent = logging ? 'ログ記録: ON' : 'ログ記録: OFF';
-    updatePanels();
-  });
-
-  btnLogDownload.addEventListener('click', ()=>{
-    if (log.length===0) { alert('ログが空です'); return; }
-    const header = 't,lat,lon,acc_m,speed_mps,heading_deg,cross_m,along_m,distA_m,AB_set,gain\n';
-    const rows = log.map(r =>
-      `${r.t},${r.lat},${r.lon},${r.acc ?? ''},${r.speed ?? ''},${r.heading ?? ''},` +
-      `${r.cross.toFixed(3)},${r.along.toFixed(3)},${r.distA.toFixed(3)},${r.abSet},${r.gain}`
-    ).join('\n');
-    const blob = new Blob([header + rows], {type: 'text/csv'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `straightbar_${new Date().toISOString().replace(/[:.]/g,'-')}.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  });
-
-  updatePanels();
-})();
+// 初期表示
+updatePanels();
 </script>
 </body>
 </html>
