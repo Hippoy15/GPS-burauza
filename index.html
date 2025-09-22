@@ -27,7 +27,7 @@
 </head>
 <body>
 <header>
-  <div>StraightBar Lite – <span class="muted">Web</span></div>
+  <div>StraightBar Lite – <span class="muted">Web</span> <span id="version" class="muted" style="font-size:0.8rem;margin-left:8px;">v2.1.0</span></div>
   <div class="stat">
     <span id="statGps">GPS: -</span>
     <span id="statAcc">精度: -</span>
@@ -782,6 +782,27 @@ btnReset.addEventListener('click', ()=>{
   setState('リセット完了','badge muted');
   updateHeader({});
 });
+
+// バージョン情報と更新履歴
+const VERSION = '2.1.0';
+const BUILD_DATE = '2024-12-19';
+const UPDATE_NOTES = [
+  'v2.1.0 (2024-12-19): GPS精度と横ズレ計算の大幅改善',
+  'v2.0.0: A点・B点設定機能の追加',
+  'v1.0.0: 初期リリース'
+];
+
+// バージョン情報をクリックで詳細表示
+document.getElementById('version').addEventListener('click', () => {
+  const notes = UPDATE_NOTES.join('\n');
+  alert(`StraightBar Lite バージョン情報\n\n${notes}\n\n現在のバージョン: ${VERSION}\nビルド日: ${BUILD_DATE}`);
+});
+
+// コンソールにバージョン情報を表示
+console.log(`%cStraightBar Lite v${VERSION}`, 'color: #2a5bff; font-size: 16px; font-weight: bold;');
+console.log(`ビルド日: ${BUILD_DATE}`);
+console.log('最新の更新内容:');
+UPDATE_NOTES.slice(0, 3).forEach(note => console.log(`  ${note}`));
 
 // 初期表示
 setState('待機中','badge muted');
