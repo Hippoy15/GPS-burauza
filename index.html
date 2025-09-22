@@ -83,7 +83,7 @@ function ll2enu(lat, lon, lat0, lon0){
   const dLon = (lon-lon0)*Math.PI/180;
   const mPerDegLat = Math.PI*R/180;
   const mPerDegLon = mPerDegLat*Math.cos(lat0*Math.PI/180);
-  return [dLon*mPerDegLon, dLat*mPerDegLat]; // [e,n]
+  return [dLon*mPerDegLon, dLat*mPerDegLat]; // [east, north]
 }
 
 function haversine(lat1,lon1,lat2,lon2){
@@ -91,6 +91,47 @@ function haversine(lat1,lon1,lat2,lon2){
   const s1=Math.sin(dLat/2), s2=Math.sin(dLon/2);
   const a=s1*s1 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*s2*s2;
   return 2*6371000*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// より正確な横ズレ計算（大円距離ベース）
+function calculateCrossTrackDistance(currentLat, currentLon, lineStartLat, lineStartLon, lineEndLat, lineEndLon) {
+  // 現在位置からラインまでの最短距離を計算
+  const R = 6371000; // 地球の半径（メートル）
+  
+  // ラインの方向ベクトル（大円上）
+  const dLat = toRad(lineEndLat - lineStartLat);
+  const dLon = toRad(lineEndLon - lineStartLon);
+  const lat1 = toRad(lineStartLat);
+  const lat2 = toRad(lineEndLat);
+  
+  // 現在位置からラインの開始点までの距離と方位
+  const currentLatRad = toRad(currentLat);
+  const currentLonRad = toRad(currentLon);
+  
+  const dLatToStart = currentLatRad - lat1;
+  const dLonToStart = currentLonRad - toRad(lineStartLon);
+  
+  const a = Math.sin(dLatToStart/2) * Math.sin(dLatToStart/2) +
+            Math.cos(lat1) * Math.cos(currentLatRad) *
+            Math.sin(dLonToStart/2) * Math.sin(dLonToStart/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const distanceToStart = R * c;
+  
+  // ラインの方位角
+  const bearing = Math.atan2(Math.sin(dLon) * Math.cos(lat2),
+                            Math.cos(lat1) * Math.sin(lat2) - 
+                            Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon));
+  
+  // 現在位置からライン開始点への方位角
+  const bearingToStart = Math.atan2(Math.sin(dLonToStart) * Math.cos(currentLatRad),
+                                   Math.cos(lat1) * Math.sin(currentLatRad) - 
+                                   Math.sin(lat1) * Math.cos(currentLatRad) * Math.cos(dLonToStart));
+  
+  // 横ズレ距離を計算
+  const crossTrackDistance = Math.asin(Math.sin(distanceToStart/R) * 
+                                      Math.sin(bearingToStart - bearing)) * R;
+  
+  return crossTrackDistance;
 }
 
 function norm(v){ return Math.hypot(v[0],v[1]); }
@@ -279,11 +320,18 @@ function updateHeader({acc=null, spd=null, head=null} = {}){
     dirEl.textContent = '--';
     subEl.textContent = '横ズレ: -- / Aから: -- / 沿線距離: --';
   } else {
-    const sign = crossTrack>0.005?'左へ':(crossTrack<-0.005?'右へ':'そのまま');
-    dirEl.textContent = (Math.abs(crossTrack)<0.005)? '0.00' : `${sign} ${Math.abs(crossTrack).toFixed(2)}`;
+    // 横ズレの表示を改善
+    const absCrossTrack = Math.abs(crossTrack);
+    let sign = '';
+    if(absCrossTrack > 0.005) {
+      sign = crossTrack > 0 ? '左へ ' : '右へ ';
+    }
     
+    dirEl.textContent = absCrossTrack < 0.005 ? '0.00' : `${sign}${absCrossTrack.toFixed(2)}`;
+    
+    // より詳細な情報表示
     const distFromA = A_ll && ref ? haversine(A_ll.lat, A_ll.lon, ref.lat, ref.lon) : 0;
-    subEl.textContent = `横ズレ: ${Math.abs(crossTrack).toFixed(2)}m / Aから: ${distFromA.toFixed(1)}m / 沿線: ${alongTrack.toFixed(1)}m`;
+    subEl.textContent = `横ズレ: ${absCrossTrack.toFixed(2)}m / Aから: ${distFromA.toFixed(1)}m / 沿線: ${alongTrack.toFixed(1)}m`;
   }
   
   draw();
@@ -343,6 +391,8 @@ async function getFreshPositionForB({durationMs=4000, accLimit=8} = {}){
     const start=Date.now();
     let done=false;
     let bestSample = null;
+    let stableCount = 0;
+    const requiredStableCount = 3; // 連続で安定した値を要求
     
     const wid=navigator.geolocation.watchPosition(
       p=>{
@@ -354,12 +404,17 @@ async function getFreshPositionForB({durationMs=4000, accLimit=8} = {}){
           bestSample = c;
         }
         
-        // 十分な精度が得られたら即座に終了
-        if(c.accuracy != null && c.accuracy <= accLimit && !done){
-          done=true; 
-          navigator.geolocation.clearWatch(wid); 
-          resolve(c);
-          return;
+        // 精度が安定しているかチェック
+        if(c.accuracy != null && c.accuracy <= accLimit) {
+          stableCount++;
+          if(stableCount >= requiredStableCount && !done){
+            done=true; 
+            navigator.geolocation.clearWatch(wid); 
+            resolve(c);
+            return;
+          }
+        } else {
+          stableCount = 0; // 精度が悪くなったらリセット
         }
         
         // タイムアウト処理
@@ -404,7 +459,7 @@ function getGPSAdvice(accuracy) {
 }
 
 // ====== ボタン動作 ======
-btnA.addEventListener('click', ()=>{
+btnA.addEventListener('click', async ()=>{
   if(!navigator.geolocation){ 
     alert('Geolocation未対応'); 
     return; 
@@ -415,11 +470,13 @@ btnA.addEventListener('click', ()=>{
   updateHeader({});
   btnA.disabled = true;
   
-  navigator.geolocation.getCurrentPosition(p=>{
-    const acc = p.coords.accuracy;
+  try {
+    // より高精度な位置取得を使用
+    const c = await getFreshPositionForB({durationMs: 3000, accLimit: 5});
+    const acc = c.accuracy;
     const advice = getGPSAdvice(acc);
     
-    if(acc && acc > 10) {
+    if(acc && acc > 8) {
       const proceed = confirm(`GPS精度: ${acc.toFixed(0)}m\n${advice}\n\nこの精度でA点を設定しますか？\n（高精度が必要な場合は「キャンセル」を選択）`);
       if(!proceed) {
         settingA = false; 
@@ -430,12 +487,10 @@ btnA.addEventListener('click', ()=>{
       }
     }
     
-    A_ll = {lat: p.coords.latitude, lon: p.coords.longitude};
+    A_ll = {lat: c.latitude, lon: c.longitude};
     
-    // 参照点をAに設定（初回のみ）
-    if(!ref) {
-      ref = {lat: A_ll.lat, lon: A_ll.lon};
-    }
+    // 参照点をAに設定（A点を基準とする）
+    ref = {lat: A_ll.lat, lon: A_ll.lon};
     
     // ライン情報をリセット
     line = null; 
@@ -445,14 +500,14 @@ btnA.addEventListener('click', ()=>{
     settingA = false; 
     btnA.disabled = false;
     setState(`A設定完了 (精度:${acc ? acc.toFixed(0)+'m' : '不明'})`,'badge ok'); 
-    updateHeader({acc: p.coords.accuracy});
-  }, e=>{
+    updateHeader({acc: acc});
+  } catch(e) {
     settingA = false; 
     btnA.disabled = false;
     setState('A取得失敗','badge bad'); 
     alert('A点取得失敗: ' + e.message);
     updateHeader({});
-  }, {enableHighAccuracy: true, maximumAge: 0, timeout: 10000});
+  }
 });
 
 btnB.addEventListener('click', async ()=>{
@@ -470,9 +525,9 @@ btnB.addEventListener('click', async ()=>{
     const c = await getFreshPositionForB();
     B_ll = {lat: c.latitude, lon: c.longitude};
     
-    // A点を原点としたENU座標でB点を計算
-    const A_enu = [0, 0]; // A点は原点
-    const B_enu = ll2enu(B_ll.lat, B_ll.lon, A_ll.lat, A_ll.lon);
+    // A点を基準としたENU座標でB点を計算（refはA点に設定済み）
+    const A_enu = [0, 0]; // A点は原点（ref基準）
+    const B_enu = ll2enu(B_ll.lat, B_ll.lon, ref.lat, ref.lon);
     const v = [B_enu[0], B_enu[1]];
     const L = norm(v);
     
@@ -500,14 +555,16 @@ btnB.addEventListener('click', async ()=>{
       }
     }
     
-    // ライン情報を作成
+    // ライン情報を作成（A点基準の座標系）
     const dir = normalize(v);
     const nHat = [-dir[1], dir[0]]; // 90度回転（右手系）
     line = {
       p0: A_enu, 
       dir: dir, 
       nHat: nHat, 
-      theta: Math.atan2(dir[1], dir[0])
+      theta: Math.atan2(dir[1], dir[0]),
+      A_ll: A_ll,  // A点の緯度経度を保存
+      B_ll: B_ll   // B点の緯度経度を保存
     };
     
     crossTrack = 0; 
@@ -569,12 +626,25 @@ btnStart.addEventListener('click', ()=>{
     const currentPos = ll2enu(c.latitude, c.longitude, ref.lat, ref.lon);
 
     // ライン設定済みの場合のみ横ズレ計算
-    if(line && A_ll) {
-      const A_enu = ll2enu(A_ll.lat, A_ll.lon, ref.lat, ref.lon);
-      const v = [currentPos[0] - A_enu[0], currentPos[1] - A_enu[1]];
+    if(line && A_ll && B_ll) {
+      // より正確な横ズレ計算（大円距離ベース）
+      crossTrack = calculateCrossTrackDistance(
+        c.latitude, c.longitude,
+        line.A_ll.lat, line.A_ll.lon,
+        line.B_ll.lat, line.B_ll.lon
+      );
       
-      crossTrack = v[0] * line.nHat[0] + v[1] * line.nHat[1];
-      alongTrack = v[0] * line.dir[0] + v[1] * line.dir[1];
+      // 沿線距離は従来の方法で計算（A点からの距離）
+      const distFromA = haversine(A_ll.lat, A_ll.lon, c.latitude, c.longitude);
+      const distFromB = haversine(B_ll.lat, B_ll.lon, c.latitude, c.longitude);
+      const abDistance = haversine(A_ll.lat, A_ll.lon, B_ll.lat, B_ll.lon);
+      
+      // A点に近い場合はA点からの距離、B点に近い場合はB点からの距離
+      if(distFromA < distFromB) {
+        alongTrack = distFromA;
+      } else {
+        alongTrack = abDistance - distFromB;
+      }
     } else {
       crossTrack = 0; 
       alongTrack = 0;
